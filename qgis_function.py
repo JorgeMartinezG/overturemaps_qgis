@@ -95,7 +95,9 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
     index = instance.parameterAsEnum(parameters, "TYPE", context)
     crs = instance.parameterAsExtentCrs(parameters, "EXTENT", context)
 
-    print(crs)
+    srid = crs.postgisSrid()
+    if srid != 4326:
+        feedback.reportError(f"Invalid srid: {srid}. Expected 4326")
 
     theme_dict = THEME_MAPS[index]
 
@@ -112,7 +114,9 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
         QgsCoordinateReferenceSystem("EPSG:4326"),
     )
 
-    xmin, ymin, xmax, ymax = extent.toRectF().getCoords()
+    bbox = extent.toRectF().getCoords()
+    feedback.pushConsoleInfo(f"Using bbox = {bbox}")
+    xmin, ymin, xmax, ymax = bbox
 
     filter = (
         (pc.field("bbox", "xmin") < xmax)
@@ -124,6 +128,8 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
     theme = theme_dict["theme"]
     overture_type = theme_dict["type"]
     path = f"overturemaps-us-west-2/release/2024-08-20.0/theme={theme}/type={overture_type}/"
+
+    feedback.pushConsoleInfo("Fetching data...")
     dataset = ds.dataset(
         path, filesystem=fs.S3FileSystem(anonymous=True, region="us-west-2")
     )
@@ -135,6 +141,8 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
         geoarrow_schema, non_empty_batches
     )
 
+    feedback.pushConsoleInfo("Processing batches")
+    counter = 1
     while True:
         try:
             batch = reader.read_next_batch()
@@ -142,8 +150,10 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
             break
         if batch.num_rows == 0:
             continue
-
+        feedback.pushConsoleInfo(f"Processing batch {counter}")
         features = [row_to_feature(row, fields) for row in batch.to_pylist()]
         [sink.addFeature(f, QgsFeatureSink.FastInsert) for f in features]
+
+        counter += 1
 
     return {"OUTPUT": dest_id}
