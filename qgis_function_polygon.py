@@ -2,7 +2,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.fs as fs
-from functools import reduce
 
 from qgis.core import (
     QgsFeature,
@@ -58,12 +57,9 @@ FIELDS = [
 ]
 
 
-def row_to_feature(row, fields, merged_source):
+def row_to_feature(row, fields):
     geom = QgsGeometry()
     geom.fromWkb(row["geometry"])
-
-    if merged_source.intersects(geom) is False:
-        return None
 
     feat = QgsFeature()
     feat.setFields(fields)
@@ -81,7 +77,11 @@ def row_to_feature(row, fields, merged_source):
     group="general",
     group_label="General",
 )
-@alg.input(type=alg.SOURCE, name="INPUT_LAYER", label="Input layer")
+@alg.input(
+    type=alg.EXTENT,
+    name="EXTENT",
+    label="Extent",
+)
 @alg.input(
     type=alg.ENUM,
     name="TYPE",
@@ -91,10 +91,11 @@ def row_to_feature(row, fields, merged_source):
 @alg.input(type=alg.SINK, name="OUTPUT", label="overturemaps_layer")
 def download_overture_maps(instance, parameters, context, feedback, inputs):
     """"""
-    source = instance.parameterAsSource(parameters, "INPUT_LAYER", context)
+    extent = instance.parameterAsExtent(parameters, "EXTENT", context)
     index = instance.parameterAsEnum(parameters, "TYPE", context)
+    crs = instance.parameterAsExtentCrs(parameters, "EXTENT", context)
 
-    srid = source.sourceCrs().postgisSrid()
+    srid = crs.postgisSrid()
     if srid != 4326:
         feedback.reportError(f"Invalid srid: {srid}. Expected 4326")
 
@@ -113,7 +114,7 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
         QgsCoordinateReferenceSystem("EPSG:4326"),
     )
 
-    bbox = source.sourceExtent().toRectF().getCoords()
+    bbox = extent.toRectF().getCoords()
     feedback.pushConsoleInfo(f"Using bbox = {bbox}")
     xmin, ymin, xmax, ymax = bbox
 
@@ -126,10 +127,12 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
 
     theme = theme_dict["theme"]
     overture_type = theme_dict["type"]
-    path = f"/Users/gis/data/om_buildings/theme={theme}/type={overture_type}/"
+    path = f"overturemaps-us-west-2/release/2024-08-20.0/theme={theme}/type={overture_type}/"
 
     feedback.pushConsoleInfo("Fetching data...")
-    dataset = ds.dataset(path)
+    dataset = ds.dataset(
+        path, filesystem=fs.S3FileSystem(anonymous=True, region="us-west-2")
+    )
     batches = dataset.to_batches(filter=filter)
     non_empty_batches = (b for b in batches if b.num_rows > 0)
 
@@ -137,9 +140,6 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
     reader = pa.RecordBatchReader.from_batches(
         geoarrow_schema, non_empty_batches
     )
-
-    source_geoms = [f.geometry() for f in source.getFeatures()]
-    merged_source = reduce(lambda acc, item: acc.combine(item), source_geoms)
 
     feedback.pushConsoleInfo("Processing batches")
     counter = 1
@@ -151,14 +151,8 @@ def download_overture_maps(instance, parameters, context, feedback, inputs):
         if batch.num_rows == 0:
             continue
         feedback.pushConsoleInfo(f"Processing batch {counter}")
-        features = [row_to_feature(row, fields, merged_source)
-                    for row in batch.to_pylist()]
-        for feature in features:
-            if feature is None:
-                feedback.pushCommandInfo("Skipping feature")
-                continue
-
-            sink.addFeature(feature, QgsFeatureSink.FastInsert)
+        features = [row_to_feature(row, fields) for row in batch.to_pylist()]
+        [sink.addFeature(f, QgsFeatureSink.FastInsert) for f in features]
 
         counter += 1
 
