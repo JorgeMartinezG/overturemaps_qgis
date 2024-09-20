@@ -3,28 +3,56 @@ import os
 from tempfile import TemporaryDirectory
 from argparse import ArgumentParser
 from osgeo import ogr
+from dataclasses import dataclass
+from typing import List
 
 BUCKET_NAME = "overturemaps-dumps"
 
 THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
 
 
-def get_country_geometry(iso3: str):
+@dataclass
+class Boundary:
+    iso3: str
+    name: str
+    rb: str
+    wkb: bytes
+
+
+def get_boundaries(maybe_iso3: List[str]) -> List[Boundary]:
     # Read shapefile layer.
-    countries_drv = ogr.GetDriverByName("flatgeobuf")
-    countries_ds = countries_drv.Open("./countries.fgb", 0)
-    countries_lyr = countries_ds.GetLayer()
+    boundaries_drv = ogr.GetDriverByName("flatgeobuf")
+    boundaries_ds = boundaries_drv.Open("./boundaries.fgb", 0)
+    if boundaries_ds is None:
+        raise ValueError("Boundaries file missing")
 
-    countries_lyr.SetAttributeFilter(f"iso3 = '{iso3}'")
-    feature = next((f for f in countries_lyr), None)
-    if feature is None:
-        raise ValueError(f"Invalid iso3 code {iso3}")
+    boundaries_lyr = boundaries_ds.GetLayer()
 
-    geom = feature.geometry()
+    filter_str = ", ".join([f"'{i}'" for i in maybe_iso3])
+    filter_str = f"iso3 IN ({filter_str})"
 
-    countries_ds = None
+    boundaries_lyr.SetAttributeFilter(filter_str)
 
-    return geom.ExportToIsoWkb()
+    boundaries = []
+    for feature in boundaries_lyr:
+        geom = feature.geometry()
+        boundary = Boundary(
+            iso3=feature["iso3"],
+            name=feature["adm0_name"],
+            rb=feature["rb"],
+            wkb=geom.ExportToIsoWkb(),
+        )
+        boundaries.append(boundary)
+
+    if len(boundaries) != len(maybe_iso3):
+        iso3_boundaries = [i.iso3 for i in boundaries]
+        missing = [i for i in maybe_iso3 if i not in iso3_boundaries]
+
+        raise ValueError(f"iso3 codes not found {missing}")
+
+    boundaries_ds = None
+
+    return boundaries
 
 
 def get_theme(type: str):
@@ -34,28 +62,25 @@ def get_theme(type: str):
     return (type, THEME_MAPPINGS[type])
 
 
-def create_file(args, tmp_dir):
-    geom_filter = ogr.CreateGeometryFromWkb(get_country_geometry(args.iso3))
+def create_file(
+    input_path: str, output_path: str, geom_wkb: bytes, layer_name: str
+):
+    geom_filter = ogr.CreateGeometryFromWkb(geom_wkb)
 
-    pq_type, pq_theme = args.type
-
-    pq_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
-    pq_driver = ogr.GetDriverByName("parquet")
-    pq_ds = pq_driver.Open(pq_path, 0)
-    pq_layer = pq_ds.GetLayer()
+    input_driver = ogr.GetDriverByName("parquet")
+    input_ds = input_driver.Open(input_path, 0)
+    input_layer = input_ds.GetLayer()
 
     # Get input dataset schema
-    defn = pq_layer.GetLayerDefn()
+    defn = input_layer.GetLayerDefn()
 
-    file_name = f"{args.iso3.lower()}_{pq_theme}_{pq_type}.fgb"
-    output_path = os.path.join(tmp_dir, file_name)
     output_driver = ogr.GetDriverByName("flatgeobuf")
     output_ds = output_driver.CreateDataSource(output_path)
 
     output_layer = output_ds.CreateLayer(
-        pq_type,
-        geom_type=pq_layer.GetGeomType(),
-        srs=pq_layer.GetSpatialRef(),
+        layer_name,
+        geom_type=input_layer.GetGeomType(),
+        srs=input_layer.GetSpatialRef(),
         options=["SPATIAL_INDEX=YES"],
     )
 
@@ -68,10 +93,10 @@ def create_file(args, tmp_dir):
     print("Processing features")
     # for count in range(0, buildings_layer.GetFeatureCount()):
     counter = 1
-    pq_layer.SetSpatialFilter(geom_filter)
+    input_layer.SetSpatialFilter(geom_filter)
     output_layer_defn = output_layer.GetLayerDefn()
 
-    for feature in pq_layer:
+    for feature in input_layer:
         output_feature = ogr.Feature(output_layer_defn)
 
         for i in range(0, output_layer_defn.GetFieldCount()):
@@ -85,7 +110,7 @@ def create_file(args, tmp_dir):
 
             output_feature.SetField(field_key, value)
         output_feature.SetGeometry(feature.GetGeometryRef())
-        if counter % 1e4 == 0:
+        if counter % 1e5 == 0:
             print(f"Processed {counter} features")
 
         output_layer.CreateFeature(output_feature)
@@ -95,10 +120,8 @@ def create_file(args, tmp_dir):
 
     # Save and close DataSources
 
-    pq_ds = None
+    input_ds = None
     output_ds = None
-
-    return output_path, file_name
 
 
 def main():
@@ -107,7 +130,8 @@ def main():
     parser.add_argument(
         "--iso3",
         dest="iso3",
-        help="Country iso3 code",
+        help="Country iso3 codes (comma separated)",
+        type=lambda x: [i for i in x.split(",")],
         required=True,
     )
     parser.add_argument(
@@ -125,20 +149,28 @@ def main():
     )
     args = parser.parse_args()
 
-    s3 = s3fs.S3FileSystem(
-        anon=False,
-        client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
-    )
+    # s3 = s3fs.S3FileSystem(
+    #     anon=False,
+    #     client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
+    # )
 
-    # Create bucket if not exists.
-    try:
-        s3.ls(BUCKET_NAME)
-    except:
-        s3.makedir(BUCKET_NAME)
+    # # Create bucket if not exists.
+    # try:
+    #     s3.ls(BUCKET_NAME)
+    # except:
+    #     s3.makedir(BUCKET_NAME)
+    pq_type, pq_theme = args.type
+    input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
+    boundaries = get_boundaries(args.iso3)
 
-    with TemporaryDirectory() as tmp_dir:
-        output_path, file_name = create_file(args, tmp_dir)
-        s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
+    for boundary in boundaries:
+        print(f"Processing boundary for {boundary.name}")
+        with TemporaryDirectory() as tmp_dir:
+            file_name = f"{boundary.iso3.lower()}_{pq_theme}_{pq_type}.fgb"
+            output_path = os.path.join(tmp_dir, file_name)
+
+            create_file(input_path, output_path, boundary.wkb, pq_type)
+            # s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
 
 
 if __name__ == "__main__":
