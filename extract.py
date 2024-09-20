@@ -1,67 +1,144 @@
-from osgeo import ogr, osr
+import s3fs
+import os
+from tempfile import TemporaryDirectory
+from argparse import ArgumentParser
+from osgeo import ogr
+
+BUCKET_NAME = "overturemaps-dumps"
+
+THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
 
 
-def main():
+def get_country_geometry(iso3: str):
     # Read shapefile layer.
-    shp_path = "/Users/gis/data/boundaries/wld_bnd_adm0_ge"
-    shp_driver = ogr.GetDriverByName("ESRI Shapefile")
-    shp_ds = shp_driver.Open(shp_path, 0)
-    boundaries_layer = shp_ds.GetLayer()
-    boundaries_layer.SetAttributeFilter("iso3 = 'LSO'")
+    countries_drv = ogr.GetDriverByName("flatgeobuf")
+    countries_ds = countries_drv.Open("./countries.fgb", 0)
+    countries_lyr = countries_ds.GetLayer()
 
-    country_boundary = next((f for f in boundaries_layer), None)
-    country_geom = country_boundary.geometry()
+    countries_lyr.SetAttributeFilter(f"iso3 = '{iso3}'")
+    feature = next((f for f in countries_lyr), None)
+    if feature is None:
+        raise ValueError(f"Invalid iso3 code {iso3}")
 
-    buildings_path = (
-        "/Users/gis/data/om_buildings/theme=buildings/type=building"
-    )
+    geom = feature.geometry()
+
+    countries_ds = None
+
+    return geom.ExportToIsoWkb()
+
+
+def get_theme(type: str):
+    if type not in THEME_MAPPINGS.keys():
+        raise ValueError("theme not found")
+
+    return (type, THEME_MAPPINGS[type])
+
+
+def create_file(args, tmp_dir):
+    geom_filter = ogr.CreateGeometryFromWkb(get_country_geometry(args.iso3))
+
+    pq_type, pq_theme = args.type
+
+    pq_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
     pq_driver = ogr.GetDriverByName("parquet")
-    dataSource = pq_driver.Open(buildings_path, 0)
-    buildings_layer = dataSource.GetLayer()
-    buildings_defn = buildings_layer.GetLayerDefn()
+    pq_ds = pq_driver.Open(pq_path, 0)
+    pq_layer = pq_ds.GetLayer()
 
-    output_path = "/Users/gis/data/lesotho.fgb"
-    out_driver = ogr.GetDriverByName("FlatGeoBuf")
-    output_ds = out_driver.CreateDataSource(output_path)
+    # Get input dataset schema
+    defn = pq_layer.GetLayerDefn()
 
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(4326)
+    file_name = f"{args.iso3.lower()}_{pq_theme}_{pq_type}.fgb"
+    output_path = os.path.join(tmp_dir, file_name)
+    output_driver = ogr.GetDriverByName("flatgeobuf")
+    output_ds = output_driver.CreateDataSource(output_path)
+
     output_layer = output_ds.CreateLayer(
-        "buildings",
-        geom_type=ogr.wkbMultiPolygon,
-        srs=srs,
+        pq_type,
+        geom_type=pq_layer.GetGeomType(),
+        srs=pq_layer.GetSpatialRef(),
         options=["SPATIAL_INDEX=YES"],
     )
 
-    for i in range(0, buildings_defn.GetFieldCount()):
-        field_defn = buildings_defn.GetFieldDefn(i)
+    for i in range(0, defn.GetFieldCount()):
+        field_defn = defn.GetFieldDefn(i)
+        if field_defn.GetType() == ogr.OFTStringList:
+            field_defn = ogr.FieldDefn(field_defn.GetNameRef(), ogr.OFTString)
         output_layer.CreateField(field_defn)
 
-    buildings_layer.SetSpatialFilter(country_geom)
-
-    output_defn = output_layer.GetLayerDefn()
     print("Processing features")
     # for count in range(0, buildings_layer.GetFeatureCount()):
-    for inFeature in buildings_layer:
-        # inFeature = buildings_layer.GetFeature(count)
-        # Create output Feature
-        outFeature = ogr.Feature(output_defn)
-        # Add field values from input Layer
-        for i in range(0, output_defn.GetFieldCount()):
-            outFeature.SetField(
-                output_defn.GetFieldDefn(i).GetNameRef(), inFeature.GetField(i)
-            )
-        # Set geometry as centroid
-        outFeature.SetGeometry(inFeature.GetGeometryRef())
-        # Add new feature to output Layer
-        output_layer.CreateFeature(outFeature)
+    counter = 1
+    pq_layer.SetSpatialFilter(geom_filter)
+    output_layer_defn = output_layer.GetLayerDefn()
 
-    inFeature = None
-    outFeature = None
+    for feature in pq_layer:
+        output_feature = ogr.Feature(output_layer_defn)
+
+        for i in range(0, output_layer_defn.GetFieldCount()):
+            field_defn = output_layer_defn.GetFieldDefn(i)
+            field_type = defn.GetFieldDefn(i).GetType()
+            field_key = field_defn.GetNameRef()
+            value = feature.GetField(i)
+
+            if field_type == ogr.OFTStringList:
+                value = ",".join(value)
+
+            output_feature.SetField(field_key, value)
+        output_feature.SetGeometry(feature.GetGeometryRef())
+        if counter % 1e4 == 0:
+            print(f"Processed {counter} features")
+
+        output_layer.CreateFeature(output_feature)
+
+        output_feature = None
+        counter += 1
+
     # Save and close DataSources
-    shp_ds = None
-    dataSource = None
+
+    pq_ds = None
     output_ds = None
+
+    return output_path, file_name
+
+
+def main():
+    parser = ArgumentParser()
+
+    parser.add_argument(
+        "--iso3",
+        dest="iso3",
+        help="Country iso3 code",
+        required=True,
+    )
+    parser.add_argument(
+        "--type",
+        dest="type",
+        type=lambda x: get_theme(x),
+        help="Overture maps type",
+        required=True,
+    )
+    parser.add_argument(
+        "--path",
+        dest="path",
+        help="Dataset path",
+        required=True,
+    )
+    args = parser.parse_args()
+
+    s3 = s3fs.S3FileSystem(
+        anon=False,
+        client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
+    )
+
+    # Create bucket if not exists.
+    try:
+        s3.ls(BUCKET_NAME)
+    except:
+        s3.makedir(BUCKET_NAME)
+
+    with TemporaryDirectory() as tmp_dir:
+        output_path, file_name = create_file(args, tmp_dir)
+        s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
 
 
 if __name__ == "__main__":
