@@ -8,7 +8,7 @@ from typing import TypedDict, Optional, List
 from utils import AWS_BUCKET_NAME, AWS_REGION
 from hdx.api.configuration import Configuration  # type: ignore
 from hdx.data.dataset import Dataset  # type: ignore
-
+from hdx.data.hdxobject import HDXError
 
 MARKDOWN = """
 This dataset is an extraction of segments and buildings from  OvertureMaps database for use in GIS applications.
@@ -133,17 +133,32 @@ def get_resources_from_s3() -> List[FileItem]:
 
     s3_objects = s3.ls(AWS_BUCKET_NAME)
     items = create_overtureitems(s3_objects)
-    resources = items_to_hdx_resources(items)
+    file_items = items_to_hdx_resources(items)
 
-    return resources
+    sorted_items: List[FileItem] = sorted(
+        file_items, key=lambda x: x["overtureitem"]["adm_name"]
+    )
+
+    return sorted_items
 
 
-def create_or_update_dataset(items: List[FileItem]) -> str:
-    ds_name = "overturemaps_extracts_wfp"
+def update_dataset(dataset: Dataset, items: List[FileItem]) -> None:
+    old_resources = dataset.get_resources()
+    [dataset.delete_resource(r) for r in old_resources]
+
+    new_resources = [i["hdx_resource"] for i in items]
+
+    dataset.add_update_resources(new_resources)
+    dataset.update_in_hdx()
+
+
+def create_dataset(ds_name: str, items: List[FileItem]) -> str:
     ds_title = "Overture Maps extracts by country"
 
-    iso3_codes = [{"name": i["overtureitem"]["iso3"].lower()} for i in items]
-    resources = [i["hdx_resource"] for i in items]
+    iso3_codes = [
+        {"name": i["overtureitem"]["iso3"].lower()} for i in sorted_items
+    ]
+    resources = [i["hdx_resource"] for i in sorted_items]
 
     metadata_draft = {
         "name": ds_name,
@@ -195,8 +210,12 @@ def main():
     )
 
     file_items = get_resources_from_s3()
-
-    dataset_id = create_or_update_dataset(file_items)
+    ds_name = "overturemaps_extracts_wfp"
+    try:
+        dataset = Dataset.read_from_hdx(ds_name)
+        update_dataset(dataset, file_items)
+    except HDXError:
+        create_dataset(ds_name, file_items)
 
 
 if __name__ == "__main__":
