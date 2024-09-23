@@ -111,7 +111,7 @@ def create_file(
             output_feature.SetField(field_key, value)
         output_feature.SetGeometry(feature.GetGeometryRef())
         if counter % 1e5 == 0:
-            print(f"Processed {counter} features")
+            print(f"Processed {counter} features", end="\r")
 
         output_layer.CreateFeature(output_feature)
 
@@ -149,16 +149,16 @@ def main():
     )
     args = parser.parse_args()
 
-    # s3 = s3fs.S3FileSystem(
-    #     anon=False,
-    #     client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
-    # )
+    s3 = s3fs.S3FileSystem(
+        anon=False,
+        client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
+    )
 
-    # # Create bucket if not exists.
-    # try:
-    #     s3.ls(BUCKET_NAME)
-    # except:
-    #     s3.makedir(BUCKET_NAME)
+    # Create bucket if not exists.
+    try:
+        s3.ls(BUCKET_NAME)
+    except:
+        s3.makedir(BUCKET_NAME)
     pq_type, pq_theme = args.type
     input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
     boundaries = get_boundaries(args.iso3)
@@ -170,7 +170,9 @@ def main():
             output_path = os.path.join(tmp_dir, file_name)
 
             create_file(input_path, output_path, boundary.wkb, pq_type)
-            # s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
+
+            print(f"Uploading file to s3: {file_name}")
+            s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
 
 
 if __name__ == "__main__":
