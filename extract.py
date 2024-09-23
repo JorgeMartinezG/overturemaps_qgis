@@ -1,5 +1,6 @@
 import s3fs
 import os
+from functools import reduce
 from tempfile import TemporaryDirectory
 from argparse import ArgumentParser
 from osgeo import ogr
@@ -17,6 +18,33 @@ class Boundary:
     name: str
     rb: str
     wkb: bytes
+    disp_area: str
+
+
+def merge_geom(iso3: str, boundaries: List[Boundary]) -> Boundary:
+    iso3_boundaries = [i for i in boundaries if i.iso3 == iso3]
+
+    if len(iso3_boundaries) == 1:
+        return iso3_boundaries[0]
+
+    geoms = [ogr.CreateGeometryFromWkb(i.wkb) for i in iso3_boundaries]
+
+    combined_geom = reduce(lambda x, y: x.Union(y), geoms)
+
+    feature = next((f for f in iso3_boundaries if f.disp_area == "no"), None)
+    if feature is None:
+        raise ValueError("only disputed areas found")
+
+    print("Merged geometry for", feature.iso3)
+
+    boundary = Boundary(
+        iso3=feature.iso3,
+        name=feature.name,
+        rb=feature.rb,
+        wkb=combined_geom.ExportToIsoWkb(),
+        disp_area=feature.disp_area,
+    )
+    return boundary
 
 
 def get_boundaries(maybe_iso3: List[str]) -> List[Boundary]:
@@ -41,18 +69,24 @@ def get_boundaries(maybe_iso3: List[str]) -> List[Boundary]:
             name=feature["adm0_name"],
             rb=feature["rb"],
             wkb=geom.ExportToIsoWkb(),
+            disp_area=feature["disp_area"],
         )
         boundaries.append(boundary)
 
-    if len(boundaries) != len(maybe_iso3):
-        iso3_boundaries = [i.iso3 for i in boundaries]
+    boundaries_ds = None
+
+    # Check for repeated s3 and merge geometries.
+    iso3_codes = set([i.iso3 for i in boundaries])
+
+    merged_boundaries = [merge_geom(i, boundaries) for i in iso3_codes]
+
+    if len(merged_boundaries) != len(maybe_iso3):
+        iso3_boundaries = [i.iso3 for i in merged_boundaries]
         missing = [i for i in maybe_iso3 if i not in iso3_boundaries]
 
         raise ValueError(f"iso3 codes not found {missing}")
 
-    boundaries_ds = None
-
-    return boundaries
+    return merged_boundaries
 
 
 def get_theme(type: str):
