@@ -6,10 +6,11 @@ from argparse import ArgumentParser
 from osgeo import ogr
 from dataclasses import dataclass
 from typing import List
-
-BUCKET_NAME = "overturemaps-dumps"
+from utils import AWS_BUCKET_NAME, AWS_REGION
 
 THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
+
+VERSION = "2024-08-20.0"
 
 
 @dataclass
@@ -185,28 +186,33 @@ def main():
 
     s3 = s3fs.S3FileSystem(
         anon=False,
-        client_kwargs={"region_name": os.getenv("AWS_DEFAULT_REGION")},
+        client_kwargs={"region_name": AWS_REGION},
     )
 
     # Create bucket if not exists.
     try:
-        s3.ls(BUCKET_NAME)
+        s3.ls(AWS_BUCKET_NAME)
     except:
-        s3.makedir(BUCKET_NAME)
+        s3.makedir(AWS_BUCKET_NAME)
     pq_type, pq_theme = args.type
     input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
+
     boundaries = get_boundaries(args.iso3)
+
+    version = VERSION.replace("-", "").replace(".", "")
 
     for boundary in boundaries:
         print(f"Processing boundary for {boundary.name}")
         with TemporaryDirectory() as tmp_dir:
-            file_name = f"{boundary.iso3.lower()}_{pq_theme}_{pq_type}.fgb"
+            file_name = (
+                f"{boundary.iso3.lower()}_{pq_theme}_{pq_type}_{version}.fgb"
+            )
             output_path = os.path.join(tmp_dir, file_name)
 
             create_file(input_path, output_path, boundary.wkb, pq_type)
 
             print(f"Uploading file to s3: {file_name}")
-            s3.put_file(output_path, os.path.join(BUCKET_NAME, file_name))
+            s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))
 
 
 if __name__ == "__main__":
