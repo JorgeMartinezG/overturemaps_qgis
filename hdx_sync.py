@@ -155,10 +155,8 @@ def update_dataset(dataset: Dataset, items: List[FileItem]) -> None:
 def create_dataset(ds_name: str, items: List[FileItem]) -> str:
     ds_title = "Overture Maps extracts by country"
 
-    iso3_codes = [
-        {"name": i["overtureitem"]["iso3"].lower()} for i in sorted_items
-    ]
-    resources = [i["hdx_resource"] for i in sorted_items]
+    iso3_codes = [{"name": i["overtureitem"]["iso3"].lower()} for i in items]
+    resources = [i["hdx_resource"] for i in items]
 
     metadata_draft = {
         "name": ds_name,
