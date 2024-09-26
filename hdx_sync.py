@@ -4,7 +4,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 from osgeo import ogr
 from pathlib import Path
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, cast
 from utils import AWS_BUCKET_NAME, AWS_REGION
 from hdx.api.configuration import Configuration  # type: ignore
 from hdx.data.dataset import Dataset  # type: ignore
@@ -125,6 +125,14 @@ def items_to_hdx_resources(items: List[OvertureItem]) -> List[FileItem]:
     return [item_to_resource(item) for item in items]
 
 
+def get_adm_name(item: FileItem) -> str:
+    overture_item = item["overtureitem"]
+    adm_name = overture_item["adm_name"]
+    if adm_name is None:
+        return ""
+    return adm_name
+
+
 def get_resources_from_s3() -> List[FileItem]:
     s3 = s3fs.S3FileSystem(
         anon=False,
@@ -136,7 +144,7 @@ def get_resources_from_s3() -> List[FileItem]:
     file_items = items_to_hdx_resources(items)
 
     sorted_items: List[FileItem] = sorted(
-        file_items, key=lambda x: x["overtureitem"]["adm_name"]
+        file_items, key=lambda x: get_adm_name(x)
     )
 
     return sorted_items
@@ -146,9 +154,9 @@ def update_dataset(dataset: Dataset, items: List[FileItem]) -> None:
     old_resources = dataset.get_resources()
     [dataset.delete_resource(r) for r in old_resources]
 
-    new_resources = [i["hdx_resource"] for i in items]
+    resources = [i["hdx_resource"] for i in items]
 
-    dataset.add_update_resources(new_resources)
+    dataset.add_update_resources(resources)  # type: ignore
     dataset.update_in_hdx()
 
 
@@ -189,7 +197,7 @@ def create_dataset(ds_name: str, items: List[FileItem]) -> str:
     dataset = Dataset(metadata_draft)
     dataset.set_expected_update_frequency("Never")
     dataset.set_reference_period("2023-07-26", "2024-08-20")
-    dataset.add_update_resources(resources)
+    dataset.add_update_resources(resources)  # type: ignore
     dataset.create_in_hdx()
 
     return ds_name
@@ -211,7 +219,7 @@ def main():
     ds_name = "overturemaps_extracts_wfp"
     try:
         dataset = Dataset.read_from_hdx(ds_name)
-        update_dataset(dataset, file_items)
+        update_dataset(cast(Dataset, dataset), file_items)
     except HDXError:
         create_dataset(ds_name, file_items)
 
