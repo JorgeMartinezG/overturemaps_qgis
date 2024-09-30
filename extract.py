@@ -71,6 +71,9 @@ def create_file(
         output_feature = None
         counter += 1
 
+        if counter == 1000:
+            break
+
     # Save and close DataSources
 
     input_ds = None
@@ -84,7 +87,7 @@ def main():
         "--ids",
         dest="ids",
         help="Object ids from geoenabler, comma separated",
-        type=lambda x: x.split(","),
+        type=lambda x: [int(i) for i in x.split(",")],
         required=True,
     )
     parser.add_argument(
@@ -121,11 +124,12 @@ def main():
     for boundary in boundaries:
         print(f"Processing boundary for {boundary.name}")
         with TemporaryDirectory() as tmp_dir:
-            file_name = f"{boundary.id}_{pq_theme}_{pq_type}_{version}.fgb"
+            file_name = f"{boundary.iso3}_{boundary.id}_{pq_theme}_{pq_type}_{version}.fgb"
             output_path = os.path.join(tmp_dir, file_name)
 
-            if boundary.wkb is not None:
-                create_file(input_path, output_path, boundary.wkb, pq_type)
+            if boundary.wkb is None:
+                continue
+            create_file(input_path, output_path, boundary.wkb, pq_type)
 
             print(f"Uploading file to s3: {file_name}")
             s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))

@@ -11,17 +11,14 @@ VERSION = "2024-08-20.0"
 
 @dataclass
 class Boundary:
-    id: str
+    id: int
+    iso3: str
     name: str
     wkb: Optional[bytes]
 
 
-def get_boundaries(
-    maybe_ids_str: List[str], with_geom: bool
-) -> List[Boundary]:
+def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
     # Read shapefile layer.
-    maybe_ids = [int(i) for i in maybe_ids_str]
-
     boundaries_drv = ogr.GetDriverByName("flatgeobuf")
     boundaries_ds = boundaries_drv.Open("./boundaries.fgb", 0)
     if boundaries_ds is None:
@@ -39,12 +36,11 @@ def get_boundaries(
         geom = feature.geometry()
         boundary = Boundary(
             id=feature["objectid"],
+            iso3=feature["iso3"],
             name=feature["adm0_name"],
             wkb=geom.ExportToIsoWkb() if with_geom is True else None,
         )
         boundaries.append(boundary)
-
-    boundaries_ds = None
 
     # Check for repeated s3 and merge geometries.
     if len(boundaries) != len(maybe_ids):

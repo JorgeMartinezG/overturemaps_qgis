@@ -99,11 +99,16 @@ def get_country_names(items: List[OvertureItem]) -> List[OvertureItem]:
 
 
 def create_overtureitems(s3_objects: List[str]) -> List[OvertureItem]:
+    overture_items = [parse_object(obj) for obj in s3_objects]
+    object_ids = list(set([i["object_id"].upper() for i in overture_items]))
+
+    object_ids = [o for o in object_ids if o != "SDN"]
+
+    boundaries = get_boundaries(object_ids, with_geom=False)
+
     import ipdb
 
     ipdb.set_trace()
-
-    overture_items = [parse_object(obj) for obj in s3_objects]
 
     items_with_country_name = get_country_names(overture_items)
     return items_with_country_name
@@ -143,6 +148,10 @@ def get_resources_from_s3() -> List[FileItem]:
 
     s3_objects = s3.ls(AWS_BUCKET_NAME)
     items = create_overtureitems(s3_objects)
+    import ipdb
+
+    ipdb.set_trace()
+
     file_items = items_to_hdx_resources(items)
 
     sorted_items: List[FileItem] = sorted(
