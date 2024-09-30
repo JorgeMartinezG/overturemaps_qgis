@@ -1,93 +1,11 @@
 import s3fs
 import os
-from functools import reduce
 from tempfile import TemporaryDirectory
 from argparse import ArgumentParser
 from osgeo import ogr
-from dataclasses import dataclass
-from typing import List
-from utils import AWS_BUCKET_NAME, AWS_REGION
+from utils import AWS_BUCKET_NAME, AWS_REGION, VERSION, get_boundaries
 
 THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
-
-VERSION = "2024-08-20.0"
-
-
-@dataclass
-class Boundary:
-    iso3: str
-    name: str
-    rb: str
-    wkb: bytes
-    disp_area: str
-
-
-def merge_geom(iso3: str, boundaries: List[Boundary]) -> Boundary:
-    iso3_boundaries = [i for i in boundaries if i.iso3 == iso3]
-
-    if len(iso3_boundaries) == 1:
-        return iso3_boundaries[0]
-
-    geoms = [ogr.CreateGeometryFromWkb(i.wkb) for i in iso3_boundaries]
-
-    combined_geom = reduce(lambda x, y: x.Union(y), geoms)
-
-    feature = next((f for f in iso3_boundaries if f.disp_area == "no"), None)
-    if feature is None:
-        raise ValueError("only disputed areas found")
-
-    print("Merged geometry for", feature.iso3)
-
-    boundary = Boundary(
-        iso3=feature.iso3,
-        name=feature.name,
-        rb=feature.rb,
-        wkb=combined_geom.ExportToIsoWkb(),
-        disp_area=feature.disp_area,
-    )
-    return boundary
-
-
-def get_boundaries(maybe_iso3: List[str]) -> List[Boundary]:
-    # Read shapefile layer.
-    boundaries_drv = ogr.GetDriverByName("flatgeobuf")
-    boundaries_ds = boundaries_drv.Open("./boundaries.fgb", 0)
-    if boundaries_ds is None:
-        raise ValueError("Boundaries file missing")
-
-    boundaries_lyr = boundaries_ds.GetLayer()
-
-    filter_str = ", ".join([f"'{i}'" for i in maybe_iso3])
-    filter_str = f"iso3 IN ({filter_str})"
-
-    boundaries_lyr.SetAttributeFilter(filter_str)
-
-    boundaries = []
-    for feature in boundaries_lyr:
-        geom = feature.geometry()
-        boundary = Boundary(
-            iso3=feature["iso3"],
-            name=feature["adm0_name"],
-            rb=feature["rb"],
-            wkb=geom.ExportToIsoWkb(),
-            disp_area=feature["disp_area"],
-        )
-        boundaries.append(boundary)
-
-    boundaries_ds = None
-
-    # Check for repeated s3 and merge geometries.
-    iso3_codes = set([i.iso3 for i in boundaries])
-
-    merged_boundaries = [merge_geom(i, boundaries) for i in iso3_codes]
-
-    if len(merged_boundaries) != len(maybe_iso3):
-        iso3_boundaries = [i.iso3 for i in merged_boundaries]
-        missing = [i for i in maybe_iso3 if i not in iso3_boundaries]
-
-        raise ValueError(f"iso3 codes not found {missing}")
-
-    return merged_boundaries
 
 
 def get_theme(type: str):
@@ -163,10 +81,10 @@ def main():
     parser = ArgumentParser()
 
     parser.add_argument(
-        "--iso3",
-        dest="iso3",
-        help="Country iso3 codes (comma separated)",
-        type=lambda x: [i for i in x.split(",")],
+        "--ids",
+        dest="ids",
+        help="Object ids from geoenabler, comma separated",
+        type=lambda x: x.split(","),
         required=True,
     )
     parser.add_argument(
@@ -197,19 +115,17 @@ def main():
     pq_type, pq_theme = args.type
     input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
 
-    boundaries = get_boundaries(args.iso3)
-
+    boundaries = get_boundaries(args.ids, with_geom=True)
     version = VERSION.replace("-", "").replace(".", "")
 
     for boundary in boundaries:
         print(f"Processing boundary for {boundary.name}")
         with TemporaryDirectory() as tmp_dir:
-            file_name = (
-                f"{boundary.iso3.lower()}_{pq_theme}_{pq_type}_{version}.fgb"
-            )
+            file_name = f"{boundary.id}_{pq_theme}_{pq_type}_{version}.fgb"
             output_path = os.path.join(tmp_dir, file_name)
 
-            create_file(input_path, output_path, boundary.wkb, pq_type)
+            if boundary.wkb is not None:
+                create_file(input_path, output_path, boundary.wkb, pq_type)
 
             print(f"Uploading file to s3: {file_name}")
             s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))

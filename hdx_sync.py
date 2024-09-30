@@ -5,7 +5,7 @@ from datetime import datetime
 from osgeo import ogr
 from pathlib import Path
 from typing import TypedDict, Optional, List, cast
-from utils import AWS_BUCKET_NAME, AWS_REGION
+from utils import AWS_BUCKET_NAME, AWS_REGION, get_boundaries
 from hdx.api.configuration import Configuration  # type: ignore
 from hdx.data.dataset import Dataset  # type: ignore
 from hdx.data.hdxobject import HDXError
@@ -17,11 +17,10 @@ The data is updated per release and include all latest updates. \n
 
 
 class OvertureItem(TypedDict):
-    iso3: str
+    object_id: str
     theme: str
     type: str
     release: str
-    adm_name: Optional[str]
     file_path: str
 
 
@@ -42,7 +41,7 @@ def parse_object(s3_object: str) -> OvertureItem:
     file_path = Path(s3_object).name
     file_name = file_path.split(".")[0]
 
-    iso3, theme, type, release_str = file_name.split("_")
+    object_id, theme, type, release_str = file_name.split("_")
 
     date_release = (
         datetime.strptime(release_str[:-1], "%Y%m%d").date().isoformat()
@@ -50,12 +49,11 @@ def parse_object(s3_object: str) -> OvertureItem:
     release = f"{date_release}.{release_str[-1]}"
 
     item: OvertureItem = {
-        "iso3": iso3,
+        "object_id": object_id,
         "theme": theme,
         "type": type,
         "release": release,
         "file_path": file_path,
-        "adm_name": None,
     }
 
     return item
@@ -101,6 +99,10 @@ def get_country_names(items: List[OvertureItem]) -> List[OvertureItem]:
 
 
 def create_overtureitems(s3_objects: List[str]) -> List[OvertureItem]:
+    import ipdb
+
+    ipdb.set_trace()
+
     overture_items = [parse_object(obj) for obj in s3_objects]
 
     items_with_country_name = get_country_names(overture_items)
