@@ -2,10 +2,9 @@ import os
 import s3fs
 from argparse import ArgumentParser
 from datetime import datetime
-from osgeo import ogr
 from pathlib import Path
-from typing import TypedDict, Optional, List, cast
-from utils import AWS_BUCKET_NAME, AWS_REGION, get_boundaries
+from typing import TypedDict, List, cast, Tuple
+from utils import AWS_BUCKET_NAME, AWS_REGION, Boundary, get_boundaries
 from hdx.api.configuration import Configuration  # type: ignore
 from hdx.data.dataset import Dataset  # type: ignore
 from hdx.data.hdxobject import HDXError
@@ -17,7 +16,7 @@ The data is updated per release and include all latest updates. \n
 
 
 class OvertureItem(TypedDict):
-    object_id: str
+    object_id: int
     theme: str
     type: str
     release: str
@@ -32,16 +31,11 @@ class Resource(TypedDict):
     last_modified: str
 
 
-class FileItem(TypedDict):
-    overtureitem: OvertureItem
-    hdx_resource: Resource
-
-
 def parse_object(s3_object: str) -> OvertureItem:
     file_path = Path(s3_object).name
     file_name = file_path.split(".")[0]
 
-    object_id, theme, type, release_str = file_name.split("_")
+    _, object_id, theme, type, release_str = file_name.split("_")
 
     date_release = (
         datetime.strptime(release_str[:-1], "%Y%m%d").date().isoformat()
@@ -49,7 +43,7 @@ def parse_object(s3_object: str) -> OvertureItem:
     release = f"{date_release}.{release_str[-1]}"
 
     item: OvertureItem = {
-        "object_id": object_id,
+        "object_id": int(object_id),
         "theme": theme,
         "type": type,
         "release": release,
@@ -59,63 +53,20 @@ def parse_object(s3_object: str) -> OvertureItem:
     return item
 
 
-def get_country_names(items: List[OvertureItem]) -> List[OvertureItem]:
-    iso3_codes = [i["iso3"].upper() for i in items]
-
-    # Read shapefile layer.
-    boundaries_drv = ogr.GetDriverByName("flatgeobuf")
-    boundaries_ds = boundaries_drv.Open("./boundaries.fgb", 0)
-    if boundaries_ds is None:
-        raise ValueError("Boundaries file missing")
-
-    boundaries_lyr = boundaries_ds.GetLayer()
-
-    filter_str = ", ".join([f"'{i}'" for i in iso3_codes])
-    filter_str = f"iso3 IN ({filter_str})"
-
-    boundaries_lyr.SetAttributeFilter(filter_str)
-
-    items_with_country = []
-    for feature in boundaries_lyr:
-        name = feature["adm0_name"]
-        iso3 = feature["iso3"]
-
-        # Find matching item in the dictionary.
-        overture_items = [i for i in items if i["iso3"] == iso3.lower()]
-        if len(overture_items) == 0:
-            raise ValueError(f"iso3 code not found {iso3}")
-
-        overture_items_with_name: List[OvertureItem] = [
-            {
-                **item,
-                "adm_name": name,
-            }
-            for item in overture_items
-        ]
-
-        items_with_country.extend(overture_items_with_name)
-
-    return items_with_country
-
-
 def create_overtureitems(s3_objects: List[str]) -> List[OvertureItem]:
-    overture_items = [parse_object(obj) for obj in s3_objects]
-    object_ids = list(set([i["object_id"].upper() for i in overture_items]))
-
-    object_ids = [o for o in object_ids if o != "SDN"]
-
-    boundaries = get_boundaries(object_ids, with_geom=False)
-
-    import ipdb
-
-    ipdb.set_trace()
-
-    items_with_country_name = get_country_names(overture_items)
-    return items_with_country_name
+    return [parse_object(obj) for obj in s3_objects]
 
 
-def item_to_resource(item: OvertureItem) -> FileItem:
-    title = f"{item['adm_name']} {item['type']} extract"
+def item_to_hdx_resource(
+    item: OvertureItem, boundaries: List[Boundary]
+) -> Resource:
+    match_boundary = next(
+        (b for b in boundaries if b.id == item["object_id"]), None
+    )
+    if match_boundary is None:
+        raise ValueError(f"No boundary match found for {item['object_id']}")
+
+    title = f"{match_boundary.name} {item['type']} extract"
 
     resource: Resource = {
         "name": title,
@@ -125,22 +76,10 @@ def item_to_resource(item: OvertureItem) -> FileItem:
         "last_modified": datetime.now().isoformat(),
     }
 
-    return {"hdx_resource": resource, "overtureitem": item}
+    return resource
 
 
-def items_to_hdx_resources(items: List[OvertureItem]) -> List[FileItem]:
-    return [item_to_resource(item) for item in items]
-
-
-def get_adm_name(item: FileItem) -> str:
-    overture_item = item["overtureitem"]
-    adm_name = overture_item["adm_name"]
-    if adm_name is None:
-        return ""
-    return adm_name
-
-
-def get_resources_from_s3() -> List[FileItem]:
+def get_resources_from_s3() -> Tuple[List[Resource], List[str]]:
     s3 = s3fs.S3FileSystem(
         anon=False,
         client_kwargs={"region_name": AWS_REGION},
@@ -148,34 +87,37 @@ def get_resources_from_s3() -> List[FileItem]:
 
     s3_objects = s3.ls(AWS_BUCKET_NAME)
     items = create_overtureitems(s3_objects)
-    import ipdb
 
-    ipdb.set_trace()
+    object_ids = list(set([i["object_id"] for i in items]))
+    boundaries = get_boundaries(object_ids, with_geom=False)
 
-    file_items = items_to_hdx_resources(items)
+    resources = [item_to_hdx_resource(i, boundaries) for i in items]
 
-    sorted_items: List[FileItem] = sorted(
-        file_items, key=lambda x: get_adm_name(x)
-    )
+    sorted_items: List[Resource] = sorted(resources, key=lambda x: x["name"])
 
-    return sorted_items
+    iso3_codes = [b.iso3 for b in boundaries]
+
+    return sorted_items, iso3_codes
 
 
-def update_dataset(dataset: Dataset, items: List[FileItem]) -> None:
-    old_resources = dataset.get_resources()
-    [dataset.delete_resource(r) for r in old_resources]
+def update_dataset(dataset: Dataset, resources: List[Resource]) -> None:
+    while True:
+        old_resources = dataset.get_resources()
+        if len(old_resources) == 0:
+            break
+        [dataset.delete_resource(r) for r in old_resources]
 
-    resources = [i["hdx_resource"] for i in items]
-
+    print("Finished removing all resources")
     dataset.add_update_resources(resources)  # type: ignore
     dataset.update_in_hdx()
 
 
-def create_dataset(ds_name: str, items: List[FileItem]) -> str:
+def create_dataset(
+    ds_name: str, resources: List[Resource], iso3_codes: List[str]
+) -> str:
     ds_title = "Overture Maps extracts by country"
 
-    iso3_codes = [{"name": i["overtureitem"]["iso3"].lower()} for i in items]
-    resources = [i["hdx_resource"] for i in items]
+    iso3_codes_dict = [{"name": i.lower()} for i in iso3_codes]
 
     metadata_draft = {
         "name": ds_name,
@@ -200,7 +142,7 @@ def create_dataset(ds_name: str, items: List[FileItem]) -> str:
                 "vocabulary_id": "b891512e-9516-4bf5-962a-7a289772a2a1",
             },
         ],
-        "groups": iso3_codes,
+        "groups": iso3_codes_dict,
         "private": False,
         "notes": MARKDOWN,
     }
@@ -226,13 +168,13 @@ def main():
         user_agent="wfp_osm",
     )
 
-    file_items = get_resources_from_s3()
+    resources, iso3_codes = get_resources_from_s3()
     ds_name = "overturemaps_extracts_wfp"
     try:
         dataset = Dataset.read_from_hdx(ds_name)
-        update_dataset(cast(Dataset, dataset), file_items)
+        update_dataset(cast(Dataset, dataset), resources)
     except HDXError:
-        create_dataset(ds_name, file_items)
+        create_dataset(ds_name, resources, iso3_codes)
 
 
 if __name__ == "__main__":
