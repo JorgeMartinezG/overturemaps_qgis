@@ -7,7 +7,6 @@ from typing import TypedDict, List, cast, Tuple
 from utils import AWS_BUCKET_NAME, AWS_REGION, Boundary, get_boundaries
 from hdx.api.configuration import Configuration  # type: ignore
 from hdx.data.dataset import Dataset  # type: ignore
-from hdx.data.hdxobject import HDXError
 
 MARKDOWN = """
 This dataset is an extraction of segments and buildings from  OvertureMaps database for use in GIS applications.
@@ -131,15 +130,15 @@ def create_dataset(
         "tags": [
             {
                 "name": "geodata",
-                "vocabulary_id": "b891512e-9516-4bf5-962a-7a289772a2a1",
             },
             {
                 "name": "roads",
-                "vocabulary_id": "b891512e-9516-4bf5-962a-7a289772a2a1",
             },
             {
                 "name": "transportation",
-                "vocabulary_id": "b891512e-9516-4bf5-962a-7a289772a2a1",
+            },
+            {
+                "name": "facilities-infrastructure",
             },
         ],
         "groups": iso3_codes_dict,
@@ -170,11 +169,12 @@ def main():
 
     resources, iso3_codes = get_resources_from_s3()
     ds_name = "overturemaps_extracts_wfp"
-    try:
-        dataset = Dataset.read_from_hdx(ds_name)
-        update_dataset(cast(Dataset, dataset), resources)
-    except HDXError:
+    dataset = Dataset.read_from_hdx(ds_name)
+
+    if dataset is None:
         create_dataset(ds_name, resources, iso3_codes)
+    else:
+        update_dataset(cast(Dataset, dataset), resources)
 
 
 if __name__ == "__main__":
