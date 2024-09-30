@@ -26,10 +26,11 @@ def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
 
     boundaries_lyr = boundaries_ds.GetLayer()
 
-    filter_str = ", ".join([f"'{i}'" for i in maybe_ids])
-    filter_str = f"objectid IN ({filter_str})"
+    if len(maybe_ids) > 0:
+        filter_str = ", ".join([f"'{i}'" for i in maybe_ids])
+        filter_str = f"objectid IN ({filter_str})"
 
-    boundaries_lyr.SetAttributeFilter(filter_str)
+        boundaries_lyr.SetAttributeFilter(filter_str)
 
     boundaries = []
     for feature in boundaries_lyr:
@@ -42,10 +43,13 @@ def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
         )
         boundaries.append(boundary)
 
+    if len(maybe_ids) == 0:
+        return boundaries
+
     # Check for repeated s3 and merge geometries.
     if len(boundaries) != len(maybe_ids):
         object_ids = set([i.id for i in boundaries])
         missing = [i for i in maybe_ids if i not in object_ids]
-        print(f"object_ids not found {missing}")
+        raise ValueError(f"object_ids not found {missing}")
 
     return boundaries
