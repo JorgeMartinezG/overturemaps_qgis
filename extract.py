@@ -3,6 +3,8 @@ import os
 from tempfile import TemporaryDirectory
 from argparse import ArgumentParser
 from osgeo import ogr
+from pathlib import Path
+from typing import List
 from utils import AWS_BUCKET_NAME, AWS_REGION, VERSION, get_boundaries
 
 THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
@@ -80,6 +82,21 @@ def create_file(
     output_ds = None
 
 
+def get_files_from_bucket(bucket_name: str) -> List[str]:
+    # Create bucket if not exists.
+    s3 = s3fs.S3FileSystem(
+        anon=False,
+        client_kwargs={"region_name": AWS_REGION},
+    )
+    try:
+        bucket_files = s3.ls(AWS_BUCKET_NAME)
+    except:
+        s3.makedir(AWS_BUCKET_NAME)
+        return []
+
+    return [Path(f).name for f in bucket_files]
+
+
 def main():
     parser = ArgumentParser()
 
@@ -88,7 +105,6 @@ def main():
         dest="ids",
         help="Object ids from geoenabler, comma separated",
         type=lambda x: [int(i) for i in x.split(",")],
-        required=True,
     )
     parser.add_argument(
         "--type",
@@ -105,16 +121,8 @@ def main():
     )
     args = parser.parse_args()
 
-    s3 = s3fs.S3FileSystem(
-        anon=False,
-        client_kwargs={"region_name": AWS_REGION},
-    )
+    files_bucket = get_files_from_bucket(AWS_BUCKET_NAME)
 
-    # Create bucket if not exists.
-    try:
-        s3.ls(AWS_BUCKET_NAME)
-    except:
-        s3.makedir(AWS_BUCKET_NAME)
     pq_type, pq_theme = args.type
     input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
 
@@ -125,6 +133,11 @@ def main():
         print(f"Processing boundary for {boundary.name}")
         with TemporaryDirectory() as tmp_dir:
             file_name = f"{boundary.iso3}_{boundary.id}_{pq_theme}_{pq_type}_{version}.fgb"
+            # Bucket already exists. Just skip it.
+            if file_name in files_bucket:
+                print(f"File {file_name} already created")
+                continue
+
             output_path = os.path.join(tmp_dir, file_name)
 
             if boundary.wkb is None:
