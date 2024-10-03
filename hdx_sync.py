@@ -100,13 +100,9 @@ def get_resources_from_s3() -> Tuple[List[Resource], List[str]]:
 
 
 def update_dataset(dataset: Dataset, resources: List[Resource]) -> None:
-    while True:
-        old_resources = dataset.get_resources()
-        if len(old_resources) == 0:
-            break
-        [dataset.delete_resource(r) for r in old_resources]
+    old_resources = Dataset.get_all_resources([dataset])
+    [dataset.delete_resource(r) for r in old_resources]
 
-    print("Finished removing all resources")
     dataset.add_update_resources(resources)  # type: ignore
     dataset.update_in_hdx()
 
