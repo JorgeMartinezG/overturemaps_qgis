@@ -1,8 +1,7 @@
 {
 	// Install LSP-json to get validation and autocompletion in this file.
 	"venvPath": "/Users/gis/venvs",
-	"venv": "qom",
+	"venv": "om",
 	"pythonVersion": "3.9",
-	"typeCheckingMode": "strict",
 	"include": ["*.py"]
 }
