@@ -126,7 +126,9 @@ def main():
     pq_type, pq_theme = args.type
     input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
 
-    boundaries = get_boundaries(args.ids, with_geom=True)
+    item_ids = args.ids if args.ids is not None else []
+
+    boundaries = get_boundaries(item_ids, with_geom=True)
     version = VERSION.replace("-", "").replace(".", "")
 
     for boundary in boundaries:

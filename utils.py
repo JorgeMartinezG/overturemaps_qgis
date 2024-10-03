@@ -34,6 +34,9 @@ def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
 
     boundaries = []
     for feature in boundaries_lyr:
+        if feature["rb"] == "-":
+            continue
+
         geom = feature.geometry()
         boundary = Boundary(
             id=feature["objectid"],
