@@ -46,6 +46,8 @@ def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
         )
         boundaries.append(boundary)
 
+    boundaries = sorted(boundaries, key=lambda x: x.name)
+
     if len(maybe_ids) == 0:
         return boundaries
 
