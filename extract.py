@@ -1,5 +1,6 @@
 import s3fs
 import os
+import shutil
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
@@ -9,8 +10,15 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from osgeo import ogr, osr
 from pathlib import Path
-from typing import Tuple, List, Any
-from utils import AWS_BUCKET_NAME, AWS_REGION, VERSION, get_boundaries, Extent
+from typing import Tuple, List, Any, Optional
+from utils import (
+    AWS_BUCKET_NAME,
+    AWS_REGION,
+    VERSION,
+    get_boundaries,
+    Extent,
+    Boundary,
+)
 
 Schema = List[Tuple[str, int]]
 
@@ -91,13 +99,18 @@ def check_geometry(geom: ogr.Geometry) -> ogr.Geometry:
     return multipolygon
 
 
-def row_to_feature(row: Any, layer_defn: ogr.FeatureDefn) -> ogr.Feature:
+def row_to_feature(
+    row: Any, layer_defn: ogr.FeatureDefn, boundary_geom: ogr.Geometry
+) -> Optional[ogr.Feature]:
+    geom = check_geometry(ogr.CreateGeometryFromWkb(row["geometry"]))
+    # if geom.Intersects(boundary_geom) is False:
+    #     return None
+
     feature = ogr.Feature(layer_defn)
     for i in range(layer_defn.GetFieldCount()):
         field_name = layer_defn.GetFieldDefn(i).GetNameRef()
         feature.SetField(field_name, row[field_name])
 
-    geom = check_geometry(ogr.CreateGeometryFromWkb(row["geometry"]))
     feature.SetGeometry(geom)
 
     return feature
@@ -106,11 +119,11 @@ def row_to_feature(row: Any, layer_defn: ogr.FeatureDefn) -> ogr.Feature:
 def get_data_from_bbox(
     s3_path: str,
     output_path: str,
-    extent: Extent,
+    boundary: Boundary,
     layer_name: str,
     theme: Theme,
 ):
-    xmin, xmax, ymin, ymax = extent
+    xmin, xmax, ymin, ymax = boundary.extent
 
     filter = (
         (pc.field("bbox", "xmin") < xmax)
@@ -153,6 +166,9 @@ def get_data_from_bbox(
     layer_defn = output_layer.GetLayerDefn()
 
     counter = 1
+
+    boundary_geom = ogr.CreateGeometryFromWkb(boundary.wkb)
+
     while True:
         try:
             batch = reader.read_next_batch()
@@ -162,9 +178,13 @@ def get_data_from_bbox(
             continue
 
         features = [
-            row_to_feature(row, layer_defn) for row in batch.to_pylist()
+            row_to_feature(row, layer_defn, boundary_geom)
+            for row in batch.to_pylist()
         ]
         for feature in features:
+            if feature is None:
+                continue
+
             output_layer.CreateFeature(feature)
             feature = None
 
@@ -239,6 +259,48 @@ def create_file(
     output_ds = None
 
 
+def filter_by_boundary(
+    input_path: str, output_path: str, geom_wkb: bytes
+) -> None:
+    geom_filter = ogr.CreateGeometryFromWkb(geom_wkb)
+
+    input_driver = ogr.GetDriverByName("flatgeobuf")
+    input_ds = input_driver.Open(input_path, 0)
+    input_layer = input_ds.GetLayer()
+
+    # Get input dataset schema
+    defn = input_layer.GetLayerDefn()
+
+    output_driver = ogr.GetDriverByName("flatgeobuf")
+    output_ds = output_driver.CreateDataSource(output_path)
+
+    output_layer = output_ds.CreateLayer(
+        input_layer.GetName(),
+        geom_type=input_layer.GetGeomType(),
+        srs=input_layer.GetSpatialRef(),
+        options=["SPATIAL_INDEX=YES"],
+    )
+
+    for i in range(0, defn.GetFieldCount()):
+        field_defn = defn.GetFieldDefn(i)
+        output_layer.CreateField(field_defn)
+
+    print("Running exact filter")
+    # for count in range(0, buildings_layer.GetFeatureCount()):
+    counter = 1
+    input_layer.SetSpatialFilter(geom_filter)
+    output_layer_defn = output_layer.GetLayerDefn()
+
+    for feature in input_layer:
+        output_layer.CreateFeature(feature)
+
+        output_feature = None
+        counter += 1
+
+    input_ds = None
+    output_ds = None
+
+
 def main():
     parser = ArgumentParser()
 
@@ -261,11 +323,11 @@ def main():
         anon=False,
         client_kwargs={"region_name": AWS_REGION},
     )
-    try:
-        bucket_files = [Path(f).name for f in s3.ls(AWS_BUCKET_NAME)]
-    except:
-        s3.makedir(AWS_BUCKET_NAME)
-        bucket_files = []
+    # try:
+    #     bucket_files = [Path(f).name for f in s3.ls(AWS_BUCKET_NAME)]
+    # except:
+    #     s3.makedir(AWS_BUCKET_NAME)
+    #     bucket_files = []
 
     theme = get_theme(args.type_str)
 
@@ -281,10 +343,10 @@ def main():
         with TemporaryDirectory() as tmp_dir:
             file_name = f"{boundary.iso3}_{boundary.id}_{theme.om_theme}_{theme.om_type}_{version}.fgb"
             # Bucket already exists. Just skip it.
-            if file_name in bucket_files:
-                print(f"File {file_name} already created")
-                continue
-
+            # if file_name in bucket_files:
+            #     print(f"File {file_name} already created")
+            #     continue
+            temp_path = os.path.join(tmp_dir, f"temp_{file_name}")
             output_path = os.path.join(tmp_dir, file_name)
 
             if boundary.wkb is None:
@@ -292,14 +354,18 @@ def main():
 
             get_data_from_bbox(
                 remote_s3_path,
-                output_path,
-                boundary.extent,
+                temp_path,
+                boundary,
                 file_name,
                 theme,
             )
 
-            print(f"Uploading file to s3: {file_name}")
-            s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))
+            filter_by_boundary(temp_path, output_path, boundary.wkb)
+
+            shutil.move(output_path, ".")
+
+            # print(f"Uploading file to s3: {file_name}")
+            # s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))
 
 
 if __name__ == "__main__":
