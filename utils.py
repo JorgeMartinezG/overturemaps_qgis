@@ -1,12 +1,14 @@
 import os
 from osgeo import ogr
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "overturemaps-extracts")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
 VERSION = "2024-08-20.0"
+
+Extent = Tuple[float, float, float, float]
 
 
 @dataclass
@@ -15,6 +17,7 @@ class Boundary:
     iso3: str
     name: str
     wkb: Optional[bytes]
+    extent: Extent
 
 
 def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
@@ -38,11 +41,14 @@ def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
             continue
 
         geom = feature.geometry()
+        extent = geom.GetEnvelope()
+
         boundary = Boundary(
             id=feature["objectid"],
             iso3=feature["iso3"],
             name=feature["adm0_name"],
             wkb=geom.ExportToIsoWkb() if with_geom is True else None,
+            extent=extent,
         )
         boundaries.append(boundary)
 

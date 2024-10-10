@@ -1,19 +1,177 @@
 import s3fs
 import os
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.fs as fs
 from tempfile import TemporaryDirectory
 from argparse import ArgumentParser
-from osgeo import ogr
+from dataclasses import dataclass
+from osgeo import ogr, osr
 from pathlib import Path
-from utils import AWS_BUCKET_NAME, AWS_REGION, VERSION, get_boundaries
+from typing import Tuple, List, Any
+from utils import AWS_BUCKET_NAME, AWS_REGION, VERSION, get_boundaries, Extent
 
-THEME_MAPPINGS = {"building": "buildings", "segment": "transportation"}
+Schema = List[Tuple[str, int]]
 
 
-def get_theme(type: str):
-    if type not in THEME_MAPPINGS.keys():
+@dataclass
+class Theme:
+    om_theme: str
+    om_type: str
+    schema: Schema
+    geom_type: int
+
+
+BUILDING_SCHEMA = [
+    ("id", ogr.OFTString),
+    ("subtype", ogr.OFTString),
+    ("class", ogr.OFTString),
+    ("level", ogr.OFTInteger),
+    ("height", ogr.OFTReal),
+]
+
+
+SEGMENT_SCHEMA = [
+    ("id", ogr.OFTString),
+    ("subtype", ogr.OFTString),
+    ("class", ogr.OFTString),
+    ("subclass", ogr.OFTString),
+]
+
+
+THEME_MAPPINGS = [
+    Theme(
+        om_theme="buildings",
+        om_type="building",
+        schema=BUILDING_SCHEMA,
+        geom_type=ogr.wkbMultiPolygon,
+    ),
+    Theme(
+        om_theme="transportation",
+        om_type="segment",
+        schema=SEGMENT_SCHEMA,
+        geom_type=ogr.wkbLineString,
+    ),
+]
+
+
+def get_theme(type: str) -> Theme:
+    theme = next((i for i in THEME_MAPPINGS if i.om_type == type), None)
+
+    if theme is None:
         raise ValueError("theme not found")
+    return theme
 
-    return (type, THEME_MAPPINGS[type])
+
+def geoarrow_schema_adapter(schema: pa.Schema) -> pa.Schema:
+    geometry_field_index = schema.get_field_index("geometry")
+    geometry_field = schema.field(geometry_field_index)
+    geoarrow_geometry_field = geometry_field.with_metadata(
+        {b"ARROW:extension:name": b"geoarrow.wkb"}
+    )
+
+    geoarrow_schema = schema.set(geometry_field_index, geoarrow_geometry_field)
+
+    return geoarrow_schema
+
+
+def check_geometry(geom: ogr.Geometry) -> ogr.Geometry:
+    geom_type = geom.GetGeometryType()
+
+    if geom_type in (ogr.wkbMultiPolygon, ogr.wkbLineString):
+        return geom
+
+    if geom_type != ogr.wkbPolygon:
+        raise ValueError("Invalid geometry type found", geom.GetGeometryName())
+
+    multipolygon = ogr.Geometry(ogr.wkbMultiPolygon)
+    multipolygon.AddGeometry(geom)
+
+    return multipolygon
+
+
+def row_to_feature(row: Any, layer_defn: ogr.FeatureDefn) -> ogr.Feature:
+    feature = ogr.Feature(layer_defn)
+    for i in range(layer_defn.GetFieldCount()):
+        field_name = layer_defn.GetFieldDefn(i).GetNameRef()
+        feature.SetField(field_name, row[field_name])
+
+    geom = check_geometry(ogr.CreateGeometryFromWkb(row["geometry"]))
+    feature.SetGeometry(geom)
+
+    return feature
+
+
+def get_data_from_bbox(
+    s3_path: str,
+    output_path: str,
+    extent: Extent,
+    layer_name: str,
+    theme: Theme,
+):
+    xmin, xmax, ymin, ymax = extent
+
+    filter = (
+        (pc.field("bbox", "xmin") < xmax)
+        & (pc.field("bbox", "xmax") > xmin)
+        & (pc.field("bbox", "ymin") < ymax)
+        & (pc.field("bbox", "ymax") > ymin)
+    )
+
+    dataset = ds.dataset(
+        s3_path, filesystem=fs.S3FileSystem(anonymous=True, region="us-west-2")
+    )
+
+    batches = dataset.to_batches(filter=filter)
+    non_empty_batches = (b for b in batches if b.num_rows > 0)
+
+    geoarrow_schema = geoarrow_schema_adapter(dataset.schema)
+    reader = pa.RecordBatchReader.from_batches(
+        geoarrow_schema, non_empty_batches
+    )
+
+    # Create output layer.
+
+    output_driver = ogr.GetDriverByName("flatgeobuf")
+    output_ds = output_driver.CreateDataSource(output_path)
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+
+    output_layer = output_ds.CreateLayer(
+        layer_name,
+        geom_type=theme.geom_type,
+        srs=srs,
+        options=["SPATIAL_INDEX=YES"],
+    )
+
+    for field_key, field_type in theme.schema:
+        ogr_field = ogr.FieldDefn(field_key, field_type)
+        output_layer.CreateField(ogr_field)
+
+    layer_defn = output_layer.GetLayerDefn()
+
+    counter = 1
+    while True:
+        try:
+            batch = reader.read_next_batch()
+        except StopIteration:
+            break
+        if batch.num_rows == 0:
+            continue
+
+        features = [
+            row_to_feature(row, layer_defn) for row in batch.to_pylist()
+        ]
+        for feature in features:
+            output_layer.CreateFeature(feature)
+            feature = None
+
+        counter += len(features)
+        print(f"Processed {counter} features", end="\r")
+
+    output_ds = None
 
 
 def create_file(
@@ -92,15 +250,8 @@ def main():
     )
     parser.add_argument(
         "--type",
-        dest="type",
-        type=lambda x: get_theme(x),
+        dest="type_str",
         help="Overture maps type",
-        required=True,
-    )
-    parser.add_argument(
-        "--path",
-        dest="path",
-        help="Dataset path",
         required=True,
     )
     args = parser.parse_args()
@@ -116,8 +267,9 @@ def main():
         s3.makedir(AWS_BUCKET_NAME)
         bucket_files = []
 
-    pq_type, pq_theme = args.type
-    input_path = f"{args.path}/theme={pq_theme}/type={pq_type}"
+    theme = get_theme(args.type_str)
+
+    remote_s3_path = f"overturemaps-us-west-2/release/{VERSION}/theme={theme.om_theme}/type={theme.om_type}/"
 
     item_ids = args.ids if args.ids is not None else []
 
@@ -127,7 +279,7 @@ def main():
     for boundary in boundaries:
         print(f"Processing boundary for {boundary.name}")
         with TemporaryDirectory() as tmp_dir:
-            file_name = f"{boundary.iso3}_{boundary.id}_{pq_theme}_{pq_type}_{version}.fgb"
+            file_name = f"{boundary.iso3}_{boundary.id}_{theme.om_theme}_{theme.om_type}_{version}.fgb"
             # Bucket already exists. Just skip it.
             if file_name in bucket_files:
                 print(f"File {file_name} already created")
@@ -137,7 +289,14 @@ def main():
 
             if boundary.wkb is None:
                 continue
-            create_file(input_path, output_path, boundary.wkb, pq_type)
+
+            get_data_from_bbox(
+                remote_s3_path,
+                output_path,
+                boundary.extent,
+                file_name,
+                theme,
+            )
 
             print(f"Uploading file to s3: {file_name}")
             s3.put_file(output_path, os.path.join(AWS_BUCKET_NAME, file_name))
