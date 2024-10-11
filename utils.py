@@ -1,8 +1,10 @@
 import os
-from osgeo import ogr
+from osgeo import ogr, gdal
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+
+gdal.SetConfigOption("AWS_NO_SIGN_REQUEST", "YES")
 
 AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "overturemaps-extracts")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
@@ -23,7 +25,9 @@ class Boundary:
 def get_boundaries(maybe_ids: List[int], with_geom: bool) -> List[Boundary]:
     # Read shapefile layer.
     boundaries_drv = ogr.GetDriverByName("flatgeobuf")
-    boundaries_ds = boundaries_drv.Open("./boundaries.fgb", 0)
+    boundaries_ds = boundaries_drv.Open(
+        f"/vsis3/{AWS_BUCKET_NAME}/boundaries.fgb", 0
+    )
     if boundaries_ds is None:
         raise ValueError("Boundaries file missing")
 
